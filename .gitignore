@@ -35,5 +35,7 @@ sbomer-contracts/
 # Kafka local dev instance logs
 podman/kafka-data/
 
+sbomer-local-dev/
+
 target/
 

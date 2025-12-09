@@ -1,87 +1,145 @@
-name: Build and Push Sbom Service Image to Quay.io
+name: SBOMer Manifest Storage Service CI/CD Pipeline
 
 on:
   push:
     branches: [ main ]
 
+env:
+  REGISTRY: quay.io
+  MANIFEST_STORAGE_SERVICE_IMAGE: sbomer/manifest-storage-service
+  HELM_CHART: manifest-storage-service-chart
+  HELM_REPO: oci://quay.io/sbomer
+
 jobs:
-  build:
-    name: Build and Push Image
+
+  build-manifest-storage-service:
+    name: Build Manifest Storage Service
     runs-on: ubuntu-22.04
-
-    env:
-      REGISTRY: quay.io
-      IMAGE_NAME: sbomer/manifest-storage-service
-      SCHEMA_REPO_DIR: sbomer-contracts
-      SCHEMA_REPO_URL: https://github.com/sbomer-project/sbomer-contracts.git
-
     permissions:
       contents: read
       packages: write
-
+      id-token: write
     outputs:
-      image: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-      digest: ${{ steps.push-to-quay.outputs.digest }}
+      image: "${{ env.REGISTRY }}/${{ env.MANIFEST_STORAGE_SERVICE_IMAGE }}"
+      digest: ${{ steps.push.outputs.digest }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Get short SHA
         id: sha
         run: echo "sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
-      - name: Set up JDK
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
           cache: 'maven'
 
-      # TEMPORARY clone the avro schema repo
+      # Schema logic (temporary)
       - name: Clone Schema Repository
-        run: git clone ${{ env.SCHEMA_REPO_URL }} ${{ env.SCHEMA_REPO_DIR }}
-
-      # TEMPORARY way of including avro schema objects
-      - name: Build and Install Schemas
+        run: git clone https://github.com/sbomer-project/sbomer-contracts.git sbomer-contracts
+      - name: Install Schemas
         run: mvn clean install
-        working-directory: ${{ env.SCHEMA_REPO_DIR }}
+        working-directory: sbomer-contracts
 
-      - name: Build with Maven
+      - name: Build Manifest Storage Service
         run: mvn clean package -Dquarkus.profile=prod
 
       - name: Build Image
-        id: build-image
+        id: build
         uses: redhat-actions/buildah-build@v2
         with:
-          image: ${{ env.IMAGE_NAME }}
+          image: ${{ env.MANIFEST_STORAGE_SERVICE_IMAGE }}
           tags: latest ${{ steps.sha.outputs.sha }}
           containerfiles: |
-            ./src/main/docker/Dockerfile.jvm
+            ./manifest-storage-service/src/main/docker/Dockerfile.jvm
 
-      - name: Push To quay.io
-        id: push-to-quay
+      - name: Push to Quay
+        id: push
         uses: redhat-actions/push-to-registry@v2
         with:
-          image: ${{ steps.build-image.outputs.image }}
-          tags: ${{ steps.build-image.outputs.tags }}
+          image: ${{ steps.build.outputs.image }}
+          tags: ${{ steps.build.outputs.tags }}
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.QUAY_USERNAME }}
           password: ${{ secrets.QUAY_TOKEN }}
 
-      - name: Print image url
-        run: echo "Image pushed to ${{ steps.push-to-quay.outputs.registry-paths }}"
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.8.1
+
+      - name: Login to Quay (Cosign)
+        run: echo "${{ secrets.QUAY_TOKEN }}" | cosign login quay.io --username "${{ secrets.QUAY_USERNAME }}" --password-stdin
+
+      - name: Sign the images with Cosign
+        run: |
+          IMAGE_URI="${{ env.REGISTRY }}/${{ env.MANIFEST_STORAGE_SERVICE_IMAGE }}@${{ steps.push.outputs.digest }}"
+          echo "Signing $IMAGE_URI"
+          cosign sign -y -a "repo=${{ github.repository }}" -a "workflow=${{ github.workflow }}" -a "sha=${{ github.sha }}" "$IMAGE_URI"
 
   provenance:
-    needs: [build]
+    needs: [build-manifest-storage-service]
     permissions:
-      actions: read # for detecting the Github Actions environment.
-      id-token: write # for creating OIDC tokens for signing.
-      packages: write # for uploading attestations.
+      actions: read
+      id-token: write
+      packages: write
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
     with:
-      image: ${{ needs.build.outputs.image }}
-      digest: ${{ needs.build.outputs.digest }}
+      image: ${{ needs.build-manifest-storage-service.outputs.image }}
+      digest: ${{ needs.build-manifest-storage-service.outputs.digest }}
     secrets:
       registry-username: ${{ secrets.QUAY_USERNAME }}
       registry-password: ${{ secrets.QUAY_TOKEN }}
+
+  publish-chart:
+    name: Publish Helm Chart
+    runs-on: ubuntu-22.04
+    needs: [provenance]
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'latest'
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.8.1
+
+      - name: Get short SHA
+        id: sha
+        run: echo "sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Package Helm Chart
+        run: |
+          # Use Run Number for SemVer (0.1.x)
+          # Use Git SHA for AppVersion (matches the images we just built)
+          
+          helm package helm/${{ env.HELM_CHART }} \
+            --destination . \
+            --version "0.1.${{ github.run_number }}" \
+            --app-version "${{ steps.sha.outputs.sha }}"
+
+      - name: Login to Quay (Helm)
+        run: echo "${{ secrets.QUAY_TOKEN }}" | helm registry login quay.io --username "${{ secrets.QUAY_USERNAME }}" --password-stdin
+
+      - name: Push Chart
+        run: helm push ${{ env.HELM_CHART }}-*.tgz ${{ env.HELM_REPO }}
+
+      - name: Login to Quay (Cosign)
+        run: echo "${{ secrets.QUAY_TOKEN }}" | cosign login quay.io --username "${{ secrets.QUAY_USERNAME }}" --password-stdin
+
+      - name: Sign Helm Chart
+        run: |
+          # Construct the full URI to the chart we just pushed
+          CHART_URI="${{ env.HELM_REPO }}/${{ env.HELM_CHART }}:0.1.${{ github.run_number }}"
+          
+          echo "Signing $CHART_URI ..."
+          cosign sign -y -a "repo=${{ github.repository }}" -a "workflow=${{ github.workflow }}" -a "sha=${{ github.sha }}" "$CHART_URI"
